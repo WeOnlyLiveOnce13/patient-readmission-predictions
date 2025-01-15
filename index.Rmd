@@ -1,0 +1,492 @@
+---
+title: "Building and deploying an ML model for patient readmissions predictions"
+subtitle: "MLOps using R, tidymodels, docker, and Vetiver."
+date: "`r Sys.Date()`"
+output: html_document
+author: "Dan A. Tshisungu"
+---
+
+# 1. About Data Analysis Report
+This RMarkdown file contains the report of the data analysis done for the project on MLOps in R: Deploying machine learning models using Vetiver. It contains the tasks and steps to complete the project, such as building a stacked prediction model, storing and version the model, and deploying the model. The final report was completed on `r date()`. 
+
+**Context:**
+
+Did you know that hospital readmissions within 30 days cost the U.S. healthcare system over $17 billion on average annually? 
+
+Having build a prediction model for hospital readmission, the next phase would be to deploy the model for clinical use.
+
+**Project artifact:**
+
+By the end of the project, learners will have constructed a fully functional deployment pipeline using Vetiver in R and monitoring tools to deploy and manage machine learning models effectively.
+
+**Data Description:**
+
+The data set for this project is an excerpt of the dataset provided during the Visual Automated Disease Analytics (VADA) summer school training, 2018. The VADA Summer School training dataset was derived from the Health Facts database (Cerner Corporation, Kansas City, MO, USA). This database contains clinical records from 130 participating hospitals across the USA. These clinical records contain information pertaining to 69,984 observations and 27 variables including patient encounter data, demographics, HbA1c levels, diagnostic testing and treatments, and patient outcomes. Data used were from 1999–2008 from a cohort of 130 hospitals, deidentified and trimmed to include only inpatient visits.
+
+Strack B, DeShazo JP, Gennings C, et al. Impact of HbA1c measurement on hospital readmission rates: analysis of 70,000 clinical database patient records. Biomed Res Int. 2014;2014:781670. doi:10.1155/2014/781670
+
+
+# 2. Setup and data loading
+
+In this task, you will import the required packages and data for this project. You may need to install these packages if not installed. You can use the `install.packages()` function.
+
+```{r data message = F, warning = F}
+## Import required packages
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(vetiver)
+library(plumber)
+library(gridExtra)
+library(skimr)
+library(DataExplorer)
+library(gt)
+library(stacks)
+library(pins)
+library(here)
+
+## Load the data set
+here::i_am("Deploy_ML_models_using_vetiver.Rmd")
+
+readmit_df <- read_csv(here("data", "final_readmit_df.csv"))
+
+## Quick data pre-processing
+readmit_df <- readmit_df %>% 
+  ## Convert character variables into factors
+  mutate_at(vars(!c(date, hospital_stay, patient_visits, 
+                    num_medications, num_diagnosis)), as.factor)
+ 
+
+## Take a glimpse at the data
+glimpse(readmit_df)
+```
+
+# 3. Exploratory Data Analysis
+
+## 3.1. Summary 
+
+```{r description}
+introduce(readmit_df) %>% 
+  gt()
+```
+
+**Note:**
+- There are no missing value.
+
+## 3.2. Frequency distribution
+
+```{r frequency}
+plot_bar(readmit_df,
+         title = "Frequency distribution of categorical variables")
+```
+
+
+**Note:**
+
+- Our target variable, `readmitted` is not very imbalanced which should give us less work.
+
+## 3.3. Numerical features distributions
+
+```{r num_featu}
+plot_histogram(readmit_df,
+               title = "Distributions of numerical features")
+```
+**Note**
+ 
+ -Numerical features are skewed, informing a need for transformation.
+ 
+## 3.4. Correlation between numerical features
+```{r correlation}
+
+plot_correlation(readmit_df,
+                 type = "continuous",
+                 title = "Correlation between continuous features")
+```
+ 
+**Note:**
+
+- Features are not correlated between them, which is good.
+
+
+# 4. Data splitting
+
+## 4.1. Create a validation set
+
+```{r val set}
+## Create a sample of 300 rows from the data
+readmit_val_set <-
+  readmit_df %>% 
+  slice_tail(n = 300) |> 
+  arrange(date)
+
+## Take the sample data from the original data
+readmit_data <- slice(readmit_df, 1:(n() - 300))
+
+## Take a glimpse at the data
+glimpse(readmit_data)
+```
+
+## 4.2. Training and testing splits
+
+```{r splits}
+## Set the seed
+set.seed(4355)
+
+## Create the data split
+readmit_split <- initial_split(readmit_data, prop = 0.75, strata = readmitted)
+
+## Create training and testing sets
+readmit_train <- training(readmit_split)
+readmit_test <- testing(readmit_split)
+
+## Check the dimension
+dim(readmit_train)
+dim(readmit_test)
+```
+
+## 4.3.Load training results
+
+Load the training results for the 8 models we trained: logistic regression, decision tree, naive bayes, k-NN, random forest, svm linear and svm RBF, and xgboost.
+
+```{r data split}
+## Setting up the control parameters
+grid_ctrl <- control_grid(
+  verbose = TRUE,        
+  save_pred = TRUE,
+  parallel_over = "everything",
+  save_workflow = TRUE
+)
+
+## Load the grid results
+grid_results <- read_rds(here("results", "readmit_grid_results.rds"))
+
+```
+
+```{r results}
+
+grid_results
+```
+
+
+
+
+# 5. Modelling
+
+Create an ensemble model with the 8 trained model.
+
+```{r stack model}
+## Create the stack object
+model_stack <- 
+  ## Initialize the stack
+  stacks() %>% 
+  ## Add candidate members
+  add_candidates(grid_results) %>% 
+  ## Determine how to combine their predictions
+  blend_predictions(metric = metric_set(f_meas),
+                    control = grid_ctrl) %>% 
+  ## Fit the candidates with non-zero stacking coefficients
+  fit_members()
+
+## Save as another model object
+readmit_model <- model_stack
+
+## Create a plot of the model
+autoplot(readmit_model)
+
+```
+
+
+```{r another plot}
+autoplot(readmit_model, type="members")
+```
+
+
+# 6. Evaluate the model on the test set
+
+Assess the performance of the ensemble model on the test set (new data).
+
+```{r stack eval}
+## Generate predictions from the test set
+readmit_test_pred <- 
+  readmit_test %>% 
+  select(readmitted) %>% 
+  bind_cols(predict(readmit_model, readmit_test, members = TRUE)) 
+
+## Print the test predictions
+readmit_test_pred
+
+
+## Create a confusion matrix
+readmit_test_pred %>% 
+  conf_mat(estimate = .pred_class, truth = readmitted) %>% 
+  autoplot()
+
+## Let's see how the ensemble model performs
+map(readmit_test_pred, f_meas_vec, truth = readmit_test_pred$readmitted) %>% 
+  as_tibble()
+
+
+```
+
+
+
+# 7. Create a vetiver object
+
+Create a Vetiver object.
+
+```{r}
+## Create a vetiver object
+v_model <- vetiver::vetiver_model(
+  readmit_model, 
+  model_name = "readmit_pred")
+
+## Turn on versioning explicitly for a temporary demo board
+model_board <- pins::board_temp(versioned = TRUE)
+
+## Store the model's version
+vetiver::vetiver_pin_write(model_board, v_model)
+
+## Read the vetiver model object from the board
+model_board %>% vetiver::vetiver_pin_read("readmit_pred")
+
+```
+
+
+# 8. Store and version the model
+
+Store and create different versions of the model.
+```{r}
+## Load the readmission model from the logistic classifier
+readmit_model <- read_rds(here("results", "final_readmission_model.rds"))
+
+## Create a vetiver object
+v_model <- vetiver_model(readmit_model, "readmit_pred")
+
+## Store model's version
+model_board %>% vetiver_pin_write(v_model)
+
+## Print both versions of the model
+model_board %>% pin_versions("readmit_pred")
+
+```
+
+# 9. Create a REST API for deployment
+
+Deploy the vetiver model object as a Plumber API and add a POST endpoint to make predictions.
+
+```{r plumber API}
+## Reload the stacked model object
+readmit_model <- model_stack
+
+## Create a vetiver model object
+v_model <- vetiver_model(readmit_model, "readmit_pred")
+
+## Deploy the model by creating a special Plumber router
+pr() %>% 
+  vetiver_api(v_model) %>% 
+  pr_run(port = 8088)
+```
+
+Running the code above would launch the API in a browser.
+
+**Steps to make predictions:**
+
+1. After running the code chunk above, a web interface will open
+
+2. Click on **return predictions from model using 11 features** because we want to make predictions
+
+3. Under **POST/Predict REQUEST**, click on example. You can copy the example below to test out the API.
+
+[
+  {
+    "race": "Others",
+    "sex": "Female",
+    "age": "<60 years",
+    "hospital_stay": 7,
+    "HbA1c": "Normal",
+    "diabetesMed": "No",
+    "admit_source": "Emerg",
+    "patient_visits": 3,
+    "num_medications": 20,
+    "num_diagnosis": 8,
+    "insulin_level": "Up"
+  }
+]
+
+
+4. Click on the **TRY** button to get a prediction.
+
+
+# 10. Create a pins board for deployment
+
+Create a pins model board for deployment.
+
+```{r}
+## Create a pins board 
+model_board <- board_folder("pins_r", versioned = TRUE)
+
+## Write the model to a pins board
+vetiver_pin_write(model_board, v_model)
+
+## Deploy to Posit Connect
+#vetiver_deploy_rsconnect(
+#    board = model_board, 
+#    name = "olayinka-arimoro/readmit_pred",
+#    predict_args = list(debug = TRUE),
+#    account = "olayinka-arimoro"
+#)
+```
+
+# 11. Deploy the model via Docker
+Deploy the model via Docker by building a Docker container.
+
+```{r docker}
+## Build a Docker container
+vetiver_prepare_docker(model_board, "readmit_pred")
+
+```
+
+**Open the Docker file, copy, and paste the lines below:**
+RUN mkdir -p /opt/ml/pins_r
+ADD pins_r/ /opt/ml/pins_r
+
+**Head over to the terminal tab and run**
+docker build --platform linux/amd64 -t readmit .
+
+**Once the image is built, you can launch by running**
+docker run -p 8000:8000 readmit
+
+**To stop the docker container, run:**
+
+**Windows:** docker stop -t 60 container_id
+
+`container_id` is the name generated by docker when you click on "container" section in docker desktop.
+
+**Mac:** docker stop $(docker ps -a -q)
+
+# 12. Predict from the model's endpoint
+
+Make predictions using the vetiver model's endpoint.
+
+```{r docker API endpoint}
+## Create the endpoint
+v_endpoint <- vetiver_endpoint("http://127.0.0.1:8000/predict")
+
+## Print the model's endpoint
+v_endpoint
+
+## Create data for a new patient
+new_patient <- tibble(race = "Others", sex = "Female",
+                  age = "<60 years", hospital_stay = 7,
+                  HbA1c = "Normal", diabetesMed = "No",
+                  admit_source = "Emerg", patient_visits = 3,
+                  num_medications = 20, num_diagnosis = 8,
+                  insulin_level = "Up")
+
+## Print out the new patient
+new_patient
+
+## Make the prediction
+predict(v_endpoint, new_patient)
+
+```
+
+
+# 13. Compute monitoring metrics
+
+Compute monitoring metrics.
+
+```{r monitor metric}
+## Read the model from the board
+v_readmit <- vetiver_pin_read(model_board, "readmit_pred")
+
+## Take a glimpse at the validation set
+glimpse(readmit_val_set)
+
+## You may save this validation set to the board
+model_board %>% pin_write(readmit_val_set, "readmit_valset")
+
+## Compute monitoring metrics
+readmit_metrics <- 
+  augment(v_readmit, new_data = readmit_val_set) %>% 
+  vetiver_compute_metrics(
+    date_var = date,
+    period = "month",
+    truth = readmitted,
+    estimate = .pred_class,
+    metric_set = yardstick::metric_set(f_meas, sens)
+  )
+
+## Print the metrics result
+readmit_metrics
+
+```
+
+# 14. Pin monitoring metrics
+
+Pin monitoring metrics to the board.
+
+```{r monitor}
+## Pin the metrics to the board
+pins::pin_write(model_board, readmit_metrics, "readmit_metrics")
+
+## Create a sample of new data
+readmit_new_valset <-
+  readmit_data |> 
+  slice_tail(n = 190) |> 
+  arrange(date)
+
+## Compute monitoring metrics with new data
+new_readmit_metrics <- 
+  augment(v_readmit, new_data = readmit_new_valset) %>% 
+  vetiver_compute_metrics(
+    date_var = date,
+    period = "month",
+    truth = readmitted,
+    estimate = .pred_class,
+    metric_set = yardstick::metric_set(f_meas, sens)
+  )
+
+## Print the new metrics result
+new_readmit_metrics
+
+## Pin the new metrics to the board
+vetiver::vetiver_pin_metrics(
+  model_board, 
+  new_readmit_metrics, 
+  "readmit_metrics", 
+  overwrite = TRUE)
+
+```
+
+# 15. Plot monitoring metrics
+
+Create a plot to track the model's performance over time.
+
+```{r monitor plot}
+## Read the pinned metrics from the board
+monitoring_metrics <- model_board %>% 
+  pin_read("readmit_metrics")
+
+## Plot the metrics
+vetiver_plot_metrics(monitoring_metrics) +
+  scale_size(range = c(2,4)) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    size = "Number of patients"
+  )
+
+```
+
+
+VoilA...
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,119 @@
+---
+title: "Monitoring dashboard for readmission model"
+output: 
+  vetiver::vetiver_dashboard:
+    pins:
+      board: !expr pins::board_folder('pins_r')
+      name: 'readmit_pred'
+      version: NULL
+    storyboard: true
+    theme: 
+      version: 4
+      bootswatch: cosmo
+    display_pins: true
+---
+
+```{r setup, include = FALSE}
+library(flexdashboard)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(vetiver)
+library(pins)
+library(plotly)
+library(reactable)
+library(parsnip)
+library(recipes)
+library(rpart)
+library(themis)
+library(workflows)
+library(yardstick)
+library(stacks)
+
+knitr::opts_chunk$set(echo = FALSE)
+#pins <- get_vetiver_dashboard_pins()
+pins <- list(
+  board = pins::board_folder('pins_r'),
+  name = "readmit_pred",
+  version = NULL
+)
+metrics_pin_name <- paste("readmit_pred", "readmit_metrics", sep = "-")
+```
+
+```{r load-vetiver-model, include = FALSE}
+# Load deployed model from pin:
+v <- vetiver_pin_read(pins$board,pins$name, pins$version)
+meta <- pin_meta(pins$board,pins$name, pins$version)
+days_old <- difftime(Sys.Date(), as.Date(meta$created), units = "days")
+```
+
+```{r validation, include = FALSE}
+# Load new validation data, from API:
+
+readmit_val <- pins::board_folder(path = "pins_r") |> 
+  pins::pin_read("readmit_valset")
+
+
+validation_aug <- augment(v, readmit_val)
+
+readmit_metrics <-
+  validation_aug  %>%
+  vetiver_compute_metrics(
+    date_var = date,
+    period = "month",
+    truth = readmitted,
+    estimate = .pred_class,
+     metric_set = yardstick::metric_set(f_meas)
+  )
+
+updated_metrics <- 
+  vetiver_pin_metrics(
+    pins$board, 
+    readmit_metrics, 
+    "readmit_metrics", 
+    overwrite = TRUE
+  )
+```
+
+### Model metrics
+
+```{r}
+## get training metrics expected from model
+# model_metrics <- tibble::as_tibble(v$metadata$user$metrics)
+
+p1 <- updated_metrics %>%
+  vetiver_plot_metrics() + 
+  scale_size(range = c(2, 5)) +
+  theme_light()
+
+p1 <- ggplotly(p1)
+hide_legend(p1)
+```
+
+***
+
+This model was published `r as.numeric(days_old)` days ago.
+
+Plot model metrics over time to *monitor* your model.
+
+**Context**: Did you know that hospital readmissions within 30 days cost the U.S. healthcare system over $17 billion on average annually?
+
+Having build a prediction model for hospital readmission, the next phase would be to deploy the model for clinical use.
+
+**Data Description:** The data set for this project is an excerpt of the dataset provided during the Visual Automated Disease Analytics (VADA) summer school training, 2018. The VADA Summer School training dataset was derived from the Health Facts database (Cerner Corporation, Kansas City, MO, USA). This database contains clinical records from 130 participating hospitals across the USA. These clinical records contain information pertaining to 69,984 observations and 27 variables including patient encounter data, demographics, HbA1c levels, diagnostic testing and treatments, and patient outcomes. Data used were from 1999--2008 from a cohort of 130 hospitals, deidentified and trimmed to include only inpatient visits.
+
+
+Strack B, DeShazo JP, Gennings C, et al. Impact of HbA1c measurement on hospital readmission rates: analysis of 70,000 clinical database patient records. Biomed Res Int. 2014;2014:781670. doi:10.1155/2014/781670
+
+### Explore validation data
+
+```{r}
+p2 <- readmit_val %>%
+  count(HbA1c) %>%
+  ggplot(aes(HbA1c, n)) +
+  geom_col() +
+  labs(x = NULL, y = "Number of HbA1c levels") +
+  theme_minimal()
+
+ggplotly(p2)
+```
