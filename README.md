@@ -16,10 +16,10 @@ Developed a Plumber API which was tested as seen below.
 
 Further containerized the model using Docker and deployed it locally for testing purpose as seen below:
 
-![Docker running](images/running docker api.PNG)
+![Docker running](images/running_docker_api.PNG)
 
 Finally using markdown template, developed a monitoring dashboard using the validation set which was not used before.
 
-![Monitoring dashboard](images/dashboard monitor.PNG)
+![Monitoring dashboard](images/dashboard_monitor.PNG)
 
 It was a nice project, and hopefully we do more in the upcoming future.
